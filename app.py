@@ -10,7 +10,7 @@ Features:
   5. Show ONE filtered data table with duration first, S.No, other columns
   6. Pick call-type and count
   7. Choose sort order
-  8. Run VAD (Silero) to get Talk Time / Silence / Dead Air / Longest Silence
+  8. Run VAD (Energy-based - No Torch Hub dependency) to get Talk Time / Silence / Dead Air / Longest Silence
   9. Transcribe each call with MULTIPLE PROVIDERS for 95%+ accuracy (SILENT)
      - Primary: AssemblyAI (96%+ accuracy)
      - Secondary: Deepgram Nova-2 (96%+ accuracy)
@@ -786,7 +786,7 @@ def transcribe_audio_with_fallback(audio_file_path, audio_url=None):
 # SENTIMENT ANALYSIS (RoBERTa)
 # ============================================================
 
-@st.cache_resource(show_spinner=False)  # ✅ No spinner
+@st.cache_resource(show_spinner=False)
 def load_sentiment_pipeline():
     """
     Load a RoBERTa-based sentiment analysis pipeline from Hugging Face.
@@ -860,46 +860,107 @@ def apply_custom_filter(df, filter_expr):
         return df
 
 # ============================================================
-# VAD FUNCTIONS
+# VAD FUNCTIONS - STREAMLIT CLOUD COMPATIBLE (No Torch Hub)
 # ============================================================
-@st.cache_resource(show_spinner=False)  # ✅ No spinner
+
+@st.cache_resource(show_spinner=False)
 def load_vad_model():
-    hub_dir = os.path.expanduser("~/.cache/torch/hub")
-    try:
-        os.makedirs(hub_dir, exist_ok=True)
-    except Exception:
-        hub_dir = os.path.join(tempfile.gettempdir(), "torch_hub")
-        os.makedirs(hub_dir, exist_ok=True)
+    """
+    Load Energy-based VAD model - Works on Streamlit Cloud without Torch Hub authentication issues
+    """
+    import torch
+    import numpy as np
     
-    torch.hub.set_dir(hub_dir)
-    try:
-        model, utils = torch.hub.load(
-            "snakers4/silero-vad", "silero_vad", force_reload=False, trust_repo=True
-        )
-    except Exception:
-        model, utils = torch.hub.load(
-            "snakers4/silero-vad", "silero_vad", force_reload=False
-        )
-    return model, utils
-
-def robust_normalize(audio):
-    rms = np.sqrt(np.mean(np.square(audio)))
-    if rms > 1e-4:
-        target_rms = 0.1
-        gain = target_rms / rms
-        gain = min(gain, 20.0)
-        audio = audio * gain
-    return np.clip(audio, -1.0, 1.0)
-
-def load_channel_16k(data, sr, channel_idx=None):
-    if data.ndim > 1:
-        chan = data[:, channel_idx] if channel_idx is not None else np.mean(data, axis=1)
-    else:
-        chan = data
-    chan = robust_normalize(chan.astype(np.float32))
-    if sr != 16000:
-        chan = librosa.resample(chan, orig_sr=sr, target_sr=16000)
-    return torch.from_numpy(chan).float()
+    class EnergyVAD:
+        """Simple but effective energy-based VAD - No external dependencies"""
+        
+        def __init__(self, sampling_rate=16000):
+            self.sampling_rate = sampling_rate
+            self.threshold = 0.15
+            self.min_speech_duration_ms = 250
+            self.min_silence_duration_ms = 200
+            self.speech_pad_ms = 300
+            
+        def __call__(self, audio_tensor, sampling_rate=16000, 
+                     threshold=None, min_speech_duration_ms=None,
+                     min_silence_duration_ms=None, speech_pad_ms=None,
+                     window_size_samples=512):
+            
+            # Use provided parameters or defaults
+            threshold = threshold or self.threshold
+            min_speech_duration_ms = min_speech_duration_ms or self.min_speech_duration_ms
+            min_silence_duration_ms = min_silence_duration_ms or self.min_silence_duration_ms
+            speech_pad_ms = speech_pad_ms or self.speech_pad_ms
+            
+            # Convert to numpy
+            if torch.is_tensor(audio_tensor):
+                audio = audio_tensor.cpu().numpy()
+            else:
+                audio = audio_tensor
+            
+            # Calculate window size (25ms)
+            window_size = int(sampling_rate * 0.025)
+            hop_size = int(sampling_rate * 0.010)  # 10ms hop
+            
+            # Compute RMS energy
+            energy = np.array([
+                np.sqrt(np.mean(audio[i:i+window_size]**2))
+                for i in range(0, max(1, len(audio)-window_size), hop_size)
+            ])
+            
+            if len(energy) == 0:
+                return []
+            
+            # Normalize
+            if energy.max() > 1e-6:
+                energy = energy / (energy.max() + 1e-6)
+            
+            # Speech detection
+            speech_mask = energy > threshold
+            
+            # Merge adjacent speech segments
+            segments = []
+            in_speech = False
+            start_idx = 0
+            
+            for i, is_speech in enumerate(speech_mask):
+                if is_speech and not in_speech:
+                    in_speech = True
+                    start_idx = i
+                elif not is_speech and in_speech:
+                    in_speech = False
+                    start_time = start_idx * hop_size / sampling_rate
+                    end_time = i * hop_size / sampling_rate
+                    duration = end_time - start_time
+                    
+                    if duration >= min_speech_duration_ms / 1000:
+                        # Add padding
+                        pad = speech_pad_ms / 1000
+                        segments.append({
+                            'start': max(0, start_time - pad),
+                            'end': min(len(audio)/sampling_rate, end_time + pad)
+                        })
+            
+            # Handle final segment
+            if in_speech:
+                start_time = start_idx * hop_size / sampling_rate
+                end_time = len(audio) / sampling_rate
+                duration = end_time - start_time
+                if duration >= min_speech_duration_ms / 1000:
+                    pad = speech_pad_ms / 1000
+                    segments.append({
+                        'start': max(0, start_time - pad),
+                        'end': min(len(audio)/sampling_rate, end_time + pad)
+                    })
+            
+            return segments
+    
+    model = EnergyVAD()
+    # Return model and utils (get_speech_timestamps function)
+    def get_speech_timestamps(audio, model, sampling_rate=16000, **kwargs):
+        return model(audio, sampling_rate, **kwargs)
+    
+    return model, [get_speech_timestamps]
 
 def merge_intervals(intervals):
     if not intervals:
@@ -940,6 +1001,28 @@ def compute_metrics(intervals, total_duration, dead_air_threshold):
         "dead_air": round(dead_air, 2),
         "longest_silence": round(longest_silence, 2),
     }
+
+# ============================================================
+# AUDIO LOADING FUNCTIONS
+# ============================================================
+def robust_normalize(audio):
+    rms = np.sqrt(np.mean(np.square(audio)))
+    if rms > 1e-4:
+        target_rms = 0.1
+        gain = target_rms / rms
+        gain = min(gain, 20.0)
+        audio = audio * gain
+    return np.clip(audio, -1.0, 1.0)
+
+def load_channel_16k(data, sr, channel_idx=None):
+    if data.ndim > 1:
+        chan = data[:, channel_idx] if channel_idx is not None else np.mean(data, axis=1)
+    else:
+        chan = data
+    chan = robust_normalize(chan.astype(np.float32))
+    if sr != 16000:
+        chan = librosa.resample(chan, orig_sr=sr, target_sr=16000)
+    return torch.from_numpy(chan).float()
 
 # ============================================================
 # STEP 1 — CLIENT + DATE RANGE + FETCH
@@ -1269,8 +1352,7 @@ if have_data:
                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         )
                                         if ff.returncode != 0 or not os.path.exists(wav_path):
-                                            err_tail = ff.stderr.decode(errors="ignore")[-300:]
-                                            debug_status = f"FFmpeg conversion failed"
+                                            debug_status = "FFmpeg conversion failed"
                                         else:
                                             data, sr = sf.read(wav_path)
                                             total_duration = len(data) / sr
@@ -1287,7 +1369,7 @@ if have_data:
                                                         speech_pad_ms=VAD_CFG["speech_pad_ms"],
                                                         window_size_samples=VAD_CFG["window_size_samples"],
                                                     )
-                                                    all_intervals.extend([(s["start"] / 16000, s["end"] / 16000) for s in ts])
+                                                    all_intervals.extend([(s["start"], s["end"]) for s in ts])
                                                 merged = merge_intervals(all_intervals)
                                             else:
                                                 tensor = load_channel_16k(data, sr)
@@ -1299,7 +1381,7 @@ if have_data:
                                                     speech_pad_ms=VAD_CFG["speech_pad_ms"],
                                                     window_size_samples=VAD_CFG["window_size_samples"],
                                                 )
-                                                merged = merge_intervals([(s["start"] / 16000, s["end"] / 16000) for s in ts])
+                                                merged = merge_intervals([(s["start"], s["end"]) for s in ts])
                                             metrics = compute_metrics(merged, total_duration, VAD_CFG["dead_air_threshold_sec"])
                                             metrics["duration"] = round(total_duration, 2)
                                             
